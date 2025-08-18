@@ -1,18 +1,14 @@
 /*
   Beta Relogin Tester — Facebook (for your *own* accounts only)
   --------------------------------------------------------------
-  v3 — Robust waits for CAPTCHA/2FA/Checkpoint; interactive human mode; better logs & screenshots.
-
-  Usage:
-    npm i puppeteer-extra puppeteer-extra-plugin-stealth otplib yargs fs-extra
-    node beta-relogin.js --creds=./accounts.txt --headless=false --human=true
-    # or single account:
-    node beta-relogin.js --email="you@example.com" --password="p@ss" --totp="BASE32" --headless=false --human=true
+  v4 — Navigation-safe state loop to avoid "Execution context was destroyed".
+        Waits for captcha/2FA/checkpoint/home and supports human mode.
 
   Outputs:
     ./out/cookies_<email>.json
     ./out/cookie_<email>.txt
-    ./out/failure_<email>_<timestamp>.png (on failures)
+    ./out/failure_<email>_<ts>.png
+    ./out/failure_<email>_<ts>.html
 */
 
 const fs = require('fs-extra');
@@ -31,10 +27,10 @@ const argv = yargs(hideBin(process.argv))
   .option('totp', { type: 'string', describe: 'TOTP secret (base32). Optional if account has no 2FA.' })
   .option('creds', { type: 'string', describe: 'Path to creds file: email|password|totp' })
   .option('headless', { type: 'boolean', default: false })
-  .option('proxy', { type: 'string', describe: 'http://user:pass@host:port (optional)' })
-  .option('timeout', { type: 'number', default: 120000 })
-  .option('human', { type: 'boolean', default: false, describe: 'Keep tab open on failure; wait for manual solving.' })
-  .option('slowmo', { type: 'number', default: 0, describe: 'Slow down operations (ms) for debugging (Puppeteer slowMo-like via delays).' })
+  .option('proxy', { type: 'string' })
+  .option('timeout', { type: 'number', default: 180000 })
+  .option('human', { type: 'boolean', default: false, describe: 'Keep tab open on failure; keep polling for success.' })
+  .option('slowmo', { type: 'number', default: 0, describe: 'Extra per-keystroke delay for debugging.' })
   .argv;
 
 const OUT_DIR = path.resolve('./out');
@@ -82,7 +78,22 @@ function toNetscapeCookieFile(cookies) {
   return header + '\n' + rows.join('\n') + '\n';
 }
 
+// --- Safe helpers that won't crash during navigations ---
+async function safeEval(page, fn, fallback = null) {
+  try { return await page.evaluate(fn); } catch { return fallback; }
+}
+async function hasSelector(page, sel, timeout = 0) {
+  try {
+    if (timeout > 0) {
+      await page.waitForSelector(sel, { timeout });
+      return true;
+    }
+    return !!(await page.$(sel));
+  } catch { return false; }
+}
+
 async function ensureHomeLoaded(page) {
+  // c_user cookie + a known surface
   const cookies = await page.cookies();
   const hasCUser = cookies.some(c => c.name === 'c_user' && c.value);
   if (!hasCUser) return false;
@@ -93,18 +104,16 @@ async function ensureHomeLoaded(page) {
 }
 
 async function isTwoFactor(page) {
-  if (await page.$('input[name="approvals_code"], #approvals_code')) return true;
-  const txt = await page.evaluate(() => document.body?.innerText || '');
+  if (await hasSelector(page, 'input[name="approvals_code"], #approvals_code')) return true;
+  const txt = await safeEval(page, () => document.body?.innerText || '', '');
   return /two[\s-]?factor|login code|approval code|authentication app/i.test(txt);
 }
-
 async function isCheckpoint(page) {
   const url = page.url();
   if (/checkpoint/i.test(url)) return true;
-  const txt = await page.evaluate(() => document.body?.innerText || '');
+  const txt = await safeEval(page, () => document.body?.innerText || '', '');
   return /confirm your identity|review recent login|checkpoint/i.test(txt);
 }
-
 async function isCaptcha(page) {
   const url = page.url();
   if (/captcha|recaptcha/i.test(url)) return true;
@@ -115,19 +124,26 @@ async function isCaptcha(page) {
     'div[aria-label*="captcha" i]',
   ];
   for (const s of selectors) {
-    if (await page.$(s)) return true;
+    if (await hasSelector(page, s)) return true;
   }
   return false;
 }
 
-async function waitForAny(page, deadlineMs) {
-  // Poll for a state transition: home / 2fa / captcha / checkpoint
-  while (Date.now() < deadlineMs) {
+async function waitForAny(page, untilMillis) {
+  // Poll for a stable state; swallow exceptions from navigations
+  while (Date.now() < untilMillis) {
     if (await ensureHomeLoaded(page)) return 'home';
     if (await isTwoFactor(page)) return '2fa';
     if (await isCaptcha(page)) return 'captcha';
     if (await isCheckpoint(page)) return 'checkpoint';
-    await sleep(600);
+
+    // Recognize device-based login hop as "in progress"
+    const url = page.url();
+    if (/\/login\/device-based\/regular\/login/i.test(url)) {
+      // nothing to do; it's normal redirect glue
+    }
+
+    await sleep(700);
   }
   return null;
 }
@@ -143,11 +159,11 @@ async function clickLogin(page) {
 }
 
 async function typeSlow(page, selector, text) {
-  await page.click(selector);
+  await page.click(selector, { delay: rand(25, 60) });
   for (const ch of String(text)) {
     await page.keyboard.type(ch);
     if (argv.slowmo) await sleep(argv.slowmo);
-    else await sleep(rand(10, 30));
+    else await sleep(rand(8, 25));
   }
 }
 
@@ -158,7 +174,7 @@ async function doLogin(page, { email, password, totp }, totalTimeoutMs) {
   log('Navigating to login…');
   await page.goto('https://www.facebook.com/login', gotoOpts);
 
-  // Early success check
+  // Early success (already logged)
   if (await ensureHomeLoaded(page)) { log('Already logged in.'); return true; }
 
   // Fill credentials
@@ -168,16 +184,16 @@ async function doLogin(page, { email, password, totp }, totalTimeoutMs) {
   await page.waitForSelector('input[name="pass"], #pass', { timeout: 30000 });
   await typeSlow(page, 'input[name="pass"], #pass', password);
 
-  // Click login
+  // Click login, then let the redirects happen
   await clickLogin(page);
 
-  // Give the page time to route. DO NOT exit early.
-  let state = await waitForAny(page, Date.now() + 45_000);
+  // Wait for first outcome or keep polling even across navigations
+  let state = await waitForAny(page, Date.now() + 60_000);
   log('Post-login state:', state || 'none yet');
 
-  // If captcha: wait generously for manual solving
+  // Captcha → wait for human to solve
   if (state === 'captcha') {
-    log('Captcha detected — please solve it manually in the visible browser.\nI will wait up to 5 minutes, then continue.');
+    log('Captcha detected — please solve it manually. Waiting up to 5 minutes…');
     const end = Date.now() + 5 * 60 * 1000;
     while (Date.now() < end) {
       if (await ensureHomeLoaded(page)) { state = 'home'; break; }
@@ -186,36 +202,38 @@ async function doLogin(page, { email, password, totp }, totalTimeoutMs) {
     }
   }
 
-  // 2FA branch (TOTP)
+  // 2FA (TOTP) branch
   if (state === '2fa' || await isTwoFactor(page)) {
     if (!totp) throw new Error('2FA required but no TOTP secret provided.');
     const code = authenticator.generate(totp);
     log('Submitting TOTP 2FA code…');
-    await page.type('input[name="approvals_code"], #approvals_code', code, { delay: rand(15, 35) });
-
-    // Continue / submit
-    const contSelectors = ['button[type="submit"]', '[id^="checkpointSubmitButton"]', 'button[name="submit[Continue]"]'];
-    for (const s of contSelectors) {
-      const el = await page.$(s);
-      if (el) { await el.click({ delay: rand(10, 30) }); break; }
+    // The field can re-render across navigations; try a few times
+    for (let i = 0; i < 3; i++) {
+      try {
+        await page.type('input[name="approvals_code"], #approvals_code', code, { delay: rand(15, 35) });
+        break;
+      } catch { await sleep(800); }
     }
 
-    // “Remember this browser” screens (0–3)
-    for (let i = 0; i < 3; i++) {
-      const next = await page.waitForSelector('button[type="submit"], [id^="checkpointSubmitButton"]', { timeout: 8000 }).then(() => true).catch(() => false);
-      if (!next) break;
-      const el = await page.$('button[type="submit"], [id^="checkpointSubmitButton"]');
-      if (el) await el.click({ delay: rand(10, 30) });
-      await sleep(800);
+    // Continue / submit (handle multiple "remember" screens)
+    const contSelectors = ['button[type="submit"]', '[id^="checkpointSubmitButton"]', 'button[name="submit[Continue]"]'];
+    for (let step = 0; step < 4; step++) {
+      let clicked = false;
+      for (const s of contSelectors) {
+        const el = await page.$(s);
+        if (el) { await el.click({ delay: rand(10, 30) }); clicked = true; break; }
+      }
+      if (!clicked) break;
+      await sleep(900);
     }
 
     try { await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }); } catch {}
-    state = await waitForAny(page, Date.now() + 20_000) || state;
+    state = await waitForAny(page, Date.now() + 25_000) || state;
   }
 
-  // Checkpoint (basic interactive handling)
+  // Checkpoint (interactive)
   if (state === 'checkpoint' || await isCheckpoint(page)) {
-    log('Checkpoint flow detected — review/continue in browser. Waiting up to 3 minutes…');
+    log('Checkpoint detected — review/continue in browser. Waiting up to 3 minutes…');
     const end = Date.now() + 3 * 60 * 1000;
     while (Date.now() < end) {
       if (await ensureHomeLoaded(page)) { state = 'home'; break; }
@@ -223,20 +241,31 @@ async function doLogin(page, { email, password, totp }, totalTimeoutMs) {
     }
   }
 
-  // Final success check
+  // Final decision
   return await ensureHomeLoaded(page);
+}
+
+async function dumpFailureArtifacts(page, email) {
+  try {
+    const ts = Date.now();
+    const base = path.join(OUT_DIR, `failure_${safe(email)}_${ts}`);
+    await page.screenshot({ path: `${base}.png`, fullPage: true }).catch(()=>{});
+    const html = await page.content().catch(() => '');
+    await fs.writeFile(`${base}.html`, html).catch(()=>{});
+    log('Saved failure artifacts:', `${base}.png`, `${base}.html`);
+  } catch {}
 }
 
 async function runOne(browser, cred) {
   const page = await browser.newPage();
 
-  // Helpful listeners for debugging
+  // Lightweight debug hooks
   page.on('console', msg => log('[console]', msg.text()));
   page.on('pageerror', err => log('[pageerror]', err.message));
   page.on('response', res => {
-    const url = res.url();
-    if (/api\/graphql|checkpoint|captcha|login/i.test(url)) {
-      log('[response]', res.status(), url);
+    const u = res.url();
+    if (/api\/graphql|checkpoint|captcha|login\/device-based/i.test(u)) {
+      log('[response]', res.status(), u);
     }
   });
 
@@ -252,13 +281,9 @@ async function runOne(browser, cred) {
     return true;
   } catch (e) {
     log(`[${cred.email}] FAILED:`, e.message);
-    try {
-      const shot = path.join(OUT_DIR, `failure_${safe(cred.email)}_${Date.now()}.png`);
-      await page.screenshot({ path: shot, fullPage: true }).catch(()=>{});
-      log('Saved failure screenshot:', shot);
-    } catch {}
+    await dumpFailureArtifacts(page, cred.email);
     if (argv.human) {
-      log('HUMAN MODE: keeping the page open for manual resolution. Close the tab when done; I will keep polling for success for up to 10 minutes.');
+      log('HUMAN MODE: keeping tab open for manual rescue. I will poll for 10 minutes and save cookies if you reach home.');
       const end = Date.now() + 10 * 60 * 1000;
       while (!page.isClosed() && Date.now() < end) {
         if (await ensureHomeLoaded(page)) { await saveCookies(page, cred.email); break; }
@@ -271,13 +296,13 @@ async function runOne(browser, cred) {
 }
 
 (async () => {
-  const launchArgs = [
+  const args = [
     '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
     '--lang=en-US,en', '--window-size=1280,800'
   ];
-  if (argv.proxy) launchArgs.push(`--proxy-server=${argv.proxy}`);
+  if (argv.proxy) args.push(`--proxy-server=${argv.proxy}`);
 
-  const browser = await puppeteer.launch({ headless: argv.headless, args: launchArgs, defaultViewport: null });
+  const browser = await puppeteer.launch({ headless: argv.headless, args, defaultViewport: null });
 
   let creds = [];
   if (argv.creds) creds = parseCredsFile(argv.creds);
